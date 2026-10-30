@@ -1,8 +1,8 @@
 #:schema https://staging.catalystcloud.dev/schemas/catalyst.schema.json
-# This repository belongs to the CTC Catalyst project, whose home repository is coalesce-labs/catalyst-cloud.
+# A rehearsal fork of coalesce-labs/catalyst-cloud-sdk, connected to the ADV Catalyst project.
 
 [project]
-linear_team = "CTC"
+linear_team = "ADV"
 
 # The same install and checks the ci.yml pull request gate runs.
 [environment]
