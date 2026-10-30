@@ -72,6 +72,7 @@ export {
   type TenantClient,
   type TenantClientOptions,
   type TenantClientBaseOptions,
+  type ReadRetryOptions,
   type TenantClientFailure,
   type TeamWorkflowFailure,
   type TeamWorkflowResult,

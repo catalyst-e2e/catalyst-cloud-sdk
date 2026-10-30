@@ -103,6 +103,21 @@ export interface TenantClientBaseOptions {
   contractCache?: ContractCacheStore;
   /** Epoch ms; injectable so a test can cross the cache bounds without sleeping. */
   now?: () => number;
+  /** Opt-in wait-and-retry for GET reads that answer 429 or 503. Absent means off. */
+  readRetry?: ReadRetryOptions;
+}
+
+/**
+ * ADV-24. A GET that answers 429 or 503 waits (the server's `Retry-After`, else 1s then 2s) and is
+ * sent again, at most 3 attempts in all. Anything but GET is sent once, as are `changes.*` and
+ * `snapshot.head`. Each attempt re-resolves auth and has its own `timeoutMs` deadline.
+ */
+export interface ReadRetryOptions {
+  /** The most seconds one call may spend sleeping, in total. A wait that would pass it is not slept:
+   *  the answer is returned as it is (a 429 as `rate-limited` with its `retryAfterSeconds`). */
+  maxWaitSeconds: number;
+  /** Injectable for tests; defaults to a `setTimeout` wait. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -136,7 +151,8 @@ export type TenantClientFailure =
   /** 403 — wrong principal class, wrong tenant, or a missing scope (`required` names it). */
   | { outcome: "forbidden"; status: 403; reason: string; required: string | null; account: string | null }
   /** 429 — the per-host daily write budget or the reserved Linear read floor. `retryAfterSeconds` is
-   *  the server's own `Retry-After` when it sent one (the read floor does; the write budget does not). */
+   *  the server's own `Retry-After` (the read floor sends one; the write budget does not), read as
+   *  delay-seconds or an HTTP date, and `null` when it is absent or unreadable. */
   | { outcome: "rate-limited"; status: 429; reason: string; retryAfterSeconds: number | null }
   /** A 400-class NAMED refusal — malformed input, a bad cursor, a tenant with no Linear workspace. */
   | { outcome: "rejected"; status: number; reason: string; attempts?: number }
@@ -1271,6 +1287,8 @@ interface Answer {
   json: unknown;
   /** The first 200 characters of a non-JSON body, for the `http`/`shape` reason. */
   textHead: string;
+  /** Epoch ms (the client's `now()`) when the answer was read; an HTTP-date `Retry-After` counts from it. */
+  receivedAtMs: number;
 }
 
 type Sent =
@@ -1288,6 +1306,30 @@ function reasonOf(answer: Answer): string {
     );
   }
   return answer.textHead;
+}
+
+const DELAY_SECONDS = /^\d+(?:\.\d+)?$/;
+const HTTP_DATE_START = /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)/i;
+
+/**
+ * ADV-24. `Retry-After` as seconds from `receivedAtMs`, from either form the header takes:
+ * delay-seconds, or an HTTP date (IMF-fixdate, RFC 850 or asctime). `null` when absent or unreadable.
+ * ⛔ The digits test runs BEFORE any `Date.parse`: `Date.parse("60")` is 1960-01-01, so a parser that
+ * tried the date first would read `Retry-After: 60` as a date in the past and wait 0 seconds. A date
+ * must start with its weekday, and ` GMT` is appended when missing so asctime is never read in the
+ * host's zone. `ceil` because an HTTP date has whole-second resolution.
+ */
+function retryAfterSeconds(headers: Headers, receivedAtMs: number): number | null {
+  const raw = headers.get("retry-after")?.trim() ?? "";
+  if (raw === "") return null;
+  if (DELAY_SECONDS.test(raw)) {
+    const seconds = Number(raw);
+    return Number.isFinite(seconds) ? seconds : null;
+  }
+  if (!HTTP_DATE_START.test(raw)) return null;
+  const at = Date.parse(raw.endsWith("GMT") ? raw : `${raw} GMT`);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, Math.ceil((at - receivedAtMs) / 1000));
 }
 
 /**
@@ -1310,9 +1352,7 @@ function classify(answer: Answer): TenantClientFailure {
     };
   }
   if (status === 429) {
-    const raw = answer.headers.get("retry-after");
-    const seconds = raw === null ? Number.NaN : Number(raw);
-    return { outcome: "rate-limited", status, reason, retryAfterSeconds: Number.isFinite(seconds) ? seconds : null };
+    return { outcome: "rate-limited", status, reason, retryAfterSeconds: retryAfterSeconds(answer.headers, answer.receivedAtMs) };
   }
   if (rec !== null && rec["outcome"] === "rejected") {
     const attempts = numberField(rec, "attempts");
@@ -1586,6 +1626,21 @@ function isPortalServer(value: unknown): value is PortalServer {
       typeof header["name"] === "string" && typeof header["secretName"] === "string");
 }
 
+/** ADV-24. The most times one read is sent under `readRetry`, the first send included. */
+const READ_RETRY_ATTEMPTS = 3;
+/** ADV-24. The answers `readRetry` waits out: rate limited, or briefly unavailable. */
+const RETRIED_STATUSES = new Set([429, 503]);
+/** The longest delay `setTimeout` honours; a longer one fires after 1 ms instead. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** The default `readRetry.sleep`. Sleeps in chunks so a wait past {@link MAX_TIMER_MS} (a caller
+ *  with no limit) is not cut to 1 ms and the read re-sent at once. */
+async function timerSleep(ms: number): Promise<void> {
+  for (let left = ms; left > 0; left -= MAX_TIMER_MS) {
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(left, MAX_TIMER_MS)));
+  }
+}
+
 export function createTenantClient(opts: TenantClientOptions): TenantClient {
   const fetchImpl = opts.fetch ?? fetch;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -1616,7 +1671,34 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
     return { authorization: `Bearer ${token}` };
   }
 
+  /**
+   * ADV-24. `sendOnce` under the caller's `readRetry`: a GET that answers 429 or 503 waits and is
+   * sent again, at most {@link READ_RETRY_ATTEMPTS} times, never sleeping past `maxWaitSeconds` in
+   * total. Without `readRetry`, or for any method but GET, it is exactly one `sendOnce`. Always
+   * returns a `Sent`; it never throws.
+   */
   async function send(
+    method: string,
+    target: string,
+    extraHeaders: Record<string, string>,
+    body?: unknown,
+  ): Promise<Sent> {
+    const retry = opts.readRetry;
+    if (retry === undefined || method !== "GET") return sendOnce(method, target, extraHeaders, body);
+    const sleep = retry.sleep ?? timerSleep;
+    let slept = 0;
+    for (let attempt = 1; ; attempt += 1) {
+      const sent = await sendOnce(method, target, extraHeaders, body);
+      if (!sent.ok || !RETRIED_STATUSES.has(sent.answer.status) || attempt >= READ_RETRY_ATTEMPTS) return sent;
+      const wait = retryAfterSeconds(sent.answer.headers, sent.answer.receivedAtMs) ?? 2 ** (attempt - 1);
+      // Written so a NaN or negative limit sleeps nothing.
+      if (!(slept + wait <= retry.maxWaitSeconds)) return sent;
+      slept += wait;
+      await sleep(wait * 1000);
+    }
+  }
+
+  async function sendOnce(
     method: string,
     target: string,
     extraHeaders: Record<string, string>,
@@ -1658,7 +1740,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
         json = undefined;
       }
     }
-    return { ok: true, answer: { status: res.status, headers: res.headers, json, textHead: text.slice(0, 200) } };
+    return { ok: true, answer: { status: res.status, headers: res.headers, json, textHead: text.slice(0, 200), receivedAtMs: now() } };
   }
 
   /**
@@ -1772,7 +1854,7 @@ export function createTenantClient(opts: TenantClientOptions): TenantClient {
         json = undefined;
       }
     }
-    return { ok: true, answer: { status: res.status, headers: res.headers, json, textHead: text.slice(0, 200) } };
+    return { ok: true, answer: { status: res.status, headers: res.headers, json, textHead: text.slice(0, 200), receivedAtMs: now() } };
   }
 
   // ── contract() ────────────────────────────────────────────────────────────────────────────────

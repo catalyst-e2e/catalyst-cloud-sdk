@@ -293,7 +293,7 @@ switch (moved.outcome) {
 
 `client.messages.read({ ticket: "CTC-1234", since: 932140 })` reads message bodies, senders (`from`) and timestamps (`sentAt`), oldest first, at most 50 a page. `since` is the inclusive backbone sequence of the `comms.message.posted` event; omit it for the first page, then pass the returned `next` as `since` on the following read. Stop paging when `messages` is empty or `next` is `null`. An empty page can retain a numeric `next`; save it to resume when another message arrives. Use your own key: a phase session credential is refused by this read route. A ticket outside your teams returns `forbidden` with the server's reason; a server without the route returns `unsupported`.
 
-The contract cache is in memory per client by default; pass `contractCache: { get, set }` to keep it on disk (the bundle does). `fetch`, `now` and `timeoutMs` are injectable so a test never opens a socket.
+The contract cache is in memory per client by default; pass `contractCache: { get, set }` to keep it on disk (the bundle does). `fetch`, `now` and `timeoutMs` are injectable so a test never opens a socket. Pass `readRetry: { maxWaitSeconds }` to have GET reads wait out a 429 or 503 (the server's `Retry-After`, else 1s then 2s, at most 3 attempts) and be sent again; the total sleep never passes `maxWaitSeconds`, and writes are never retried.
 
 **CTC-2132 — the remaining routes the bundle's own transport used to reach:**
 
